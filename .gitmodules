@@ -1,0 +1,3 @@
+[submodule "evo_usb_py"]
+	path = evo_usb_py
+	url = https://github.com/Evo-Programming/evo_usb_py.git
