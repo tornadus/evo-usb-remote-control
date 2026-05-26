@@ -17,7 +17,7 @@ from dataclasses import dataclass
 
 import numpy as np
 from PyQt6.QtCore import Qt, QObject, pyqtSignal
-from PyQt6.QtGui import QFont, QImage, QKeyEvent, QPixmap
+from PyQt6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLayout, QMainWindow, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
@@ -117,6 +117,7 @@ class UsbWorker(QObject):
     busy = pyqtSignal(bool)      # True when a transfer starts, False at end
     file_list = pyqtSignal(object)   # list[dict] from list_files()
     finished = pyqtSignal(bool, str)  # (success, human-readable message)
+    connection = pyqtSignal(bool, str)  # (online, reason); edge-triggered
 
     # Queue sentinels (never valid scancodes) for non-scancode actions.
     _REFRESH = -1
@@ -126,6 +127,10 @@ class UsbWorker(QObject):
         super().__init__()
         self.poll_ms = poll_ms
         self.poll_enabled = True
+        # None until the first grab, so that first outcome always emits a
+        # `connection` edge (drives the startup overlay either way).
+        self._online: bool | None = None
+        self._offline_probe_ms = 750    # reconnect probe cadence while offline
         self._q: "queue.Queue[int | _SendCmd | _ListCmd | _RecvCmd " \
             "| _DeleteCmd]" = queue.Queue()
         self._stop = threading.Event()
@@ -163,6 +168,26 @@ class UsbWorker(QObject):
         self._q.put(_DeleteCmd(name, type_id))
 
     # --- worker-thread internals ---
+    def _set_online(self, online: bool, reason: str = ""):
+        """Flip connection state, emitting `connection` only on a transition.
+
+        The initial None state means the first call always emits, so the GUI
+        learns the startup state before any frame has arrived.
+        """
+        if online == self._online:
+            return
+        self._online = online
+        self.connection.emit(online, reason)
+
+    @staticmethod
+    def _reason_for(e) -> str:
+        # Overlay text only; the detailed error goes to the status signal
+        # (and so to the debug window). SystemExit == connect() found no
+        # device; everything else is a link that was up and dropped.
+        if isinstance(e, SystemExit):
+            return "Searching for calculator…"
+        return "Disconnected"
+
     def _dispatch(self, code):
         if isinstance(code, int):
             if code == self._REFRESH:
@@ -188,6 +213,7 @@ class UsbWorker(QObject):
             return True
         except (Exception, SystemExit) as e:
             self.status.emit(f"send 0x{code:02X} failed: {e}")
+            self._set_online(False, self._reason_for(e))
             time.sleep(0.25)
             return False
 
@@ -197,6 +223,7 @@ class UsbWorker(QObject):
             return True
         except (Exception, SystemExit) as e:
             self.status.emit(f"break failed: {e}")
+            self._set_online(False, self._reason_for(e))
             time.sleep(0.25)
             return False
 
@@ -208,10 +235,14 @@ class UsbWorker(QObject):
             if len(rgb) == SCREEN_BYTES:
                 self.frame.emit(rgb)
                 self.status.emit(f"connected · screen {dt:.0f} ms")
+                self._set_online(True)
             else:
+                # Partial read: link is up but desynced (see capture_screen's
+                # retry note), not a disconnect, so stay online.
                 self.status.emit(f"short frame: {len(rgb)}B")
         except (Exception, SystemExit) as e:
             self.status.emit(f"screen read failed: {e}")
+            self._set_online(False, self._reason_for(e))
             time.sleep(0.25)
 
     @contextmanager
@@ -241,6 +272,7 @@ class UsbWorker(QObject):
                 self.file_list.emit(entries)
             except (Exception, SystemExit) as e:
                 self.status.emit(f"list failed: {e}")
+                self._set_online(False, self._reason_for(e))
                 self.finished.emit(
                     False, f"Could not read the calculator: {e}")
 
@@ -258,6 +290,7 @@ class UsbWorker(QObject):
                 self.finished.emit(True, msg)
             except (Exception, SystemExit) as e:
                 self.status.emit(f"send failed: {e}")
+                self._set_online(False, self._reason_for(e))
                 self.finished.emit(False, f"Send failed: {e}")
 
     def _do_recv(self, cmd: _RecvCmd):
@@ -269,6 +302,7 @@ class UsbWorker(QObject):
                 self.finished.emit(True, msg)
             except (Exception, SystemExit) as e:
                 self.status.emit(f"receive failed: {e}")
+                self._set_online(False, self._reason_for(e))
                 self.finished.emit(False, f"Receive failed: {e}")
 
     def _do_delete(self, cmd: _DeleteCmd):
@@ -280,6 +314,7 @@ class UsbWorker(QObject):
                 self.finished.emit(True, msg)
             except (Exception, SystemExit) as e:
                 self.status.emit(f"delete failed: {e}")
+                self._set_online(False, self._reason_for(e))
                 self.finished.emit(False, f"Delete failed: {e}")
 
     def _run(self):
@@ -305,6 +340,12 @@ class UsbWorker(QObject):
                 time.sleep(0.02)         # let the calc render the keypress
                 self._grab()
                 last = time.monotonic()
+            elif self._online is False:
+                # Keep probing for reconnect even with --no-poll / Live off,
+                # otherwise a non-polling user would never recover.
+                if (now - last) * 1000 >= self._offline_probe_ms:
+                    self._grab()
+                    last = time.monotonic()   # re-read; _grab can block
             elif self.poll_enabled and (now - last) * 1000 >= self.poll_ms:
                 self._grab()
                 last = now
@@ -367,6 +408,35 @@ class DebugWindow(QWidget):
         self.worker.poll_ms = int(val)
 
 
+class Overlay(QWidget):
+    """Translucent veil over the screen label, shown while offline.
+
+    Dims the last (frozen) frame with a dark wash and draws centered status
+    text on top. Mouse-transparent so the keypad underneath stays usable.
+    """
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self._text = "Searching for calculator…"
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.hide()
+
+    def set_text(self, text: str):
+        self._text = text
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor(0, 0, 0, 150))    # ~60% dark veil
+        p.setPen(QColor(235, 238, 242))
+        f = self.font()
+        f.setPixelSize(14)
+        f.setBold(True)
+        p.setFont(f)
+        flags = Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap
+        p.drawText(self.rect().adjusted(10, 10, -10, -10), flags, self._text)
+
+
 class RemoteWindow(QMainWindow):
     def __init__(self, worker: UsbWorker, scale: int = 1, debug: bool = False):
         super().__init__()
@@ -377,6 +447,8 @@ class RemoteWindow(QMainWindow):
         # Whether a pending file_list is for a "recv" or "delete" interaction,
         # so a stray listing never pops a dialog. None when nothing is awaited.
         self._awaiting_list: str | None = None
+        # Mirror of the worker's connection state; gates input while offline.
+        self._online = False
         self.setWindowTitle("TI-84 Evo - USB remote")
 
         central = QWidget()
@@ -418,6 +490,10 @@ class RemoteWindow(QMainWindow):
         outer.addWidget(self.screen_label,
                         alignment=Qt.AlignmentFlag.AlignCenter)
 
+        # Disconnect veil, parented to the same widget that owns the screen
+        # label's layout, so its geometry maps cleanly over the label.
+        self.overlay = Overlay(central)
+
         # Virtual keypad.
         outer.addWidget(build_keypad(self.press_key),
                         alignment=Qt.AlignmentFlag.AlignHCenter)
@@ -443,6 +519,7 @@ class RemoteWindow(QMainWindow):
         worker.busy.connect(self._on_busy)
         worker.file_list.connect(self._on_file_list)
         worker.finished.connect(self._on_finished)
+        worker.connection.connect(self._on_connection)
 
     def _on_status(self, text: str):
         # Route to the debug window if open. Otherwise only surface real
@@ -532,8 +609,50 @@ class RemoteWindow(QMainWindow):
         else:
             QMessageBox.warning(self, "Transfer", msg)
 
+    # --- connection state / overlay ---
+    def _sync_overlay(self):
+        """Align the overlay to the screen label's current geometry."""
+        parent = self.overlay.parentWidget()
+        top_left = self.screen_label.mapTo(
+            parent, self.screen_label.rect().topLeft())
+        self.overlay.setGeometry(
+            top_left.x(), top_left.y(),
+            self.screen_label.width(), self.screen_label.height())
+        self.overlay.raise_()
+
+    def _on_connection(self, online: bool, reason: str):
+        self._online = online
+        # A dead link can't accept transfers; mirror the busy disabling.
+        self.send_action.setEnabled(online)
+        self.recv_action.setEnabled(online)
+        self.delete_action.setEnabled(online)
+        if online:
+            self.overlay.hide()
+        else:
+            self.overlay.set_text(reason)
+            self._sync_overlay()
+            self.overlay.show()
+            self.overlay.raise_()
+
+    def showEvent(self, event):
+        # The layout only finalizes the label's position once shown; sync the
+        # veil here and bring it up as "Searching…" until the first frame.
+        super().showEvent(event)
+        self._sync_overlay()
+        if not self._online:
+            self.overlay.show()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_overlay()
+
     # --- input ---
     def press_key(self, label: str):
+        if not self._online:
+            # Drop keystrokes while offline so they can't pile up behind
+            # failing sends and replay as a burst on reconnect.
+            self._on_status("offline · keystroke ignored")
+            return
         if label == "ON":
             # ON isn't a normal key-matrix scancode on hardware. The calc's
             # break command is its real "quit to home" behavior over USB.
