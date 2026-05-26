@@ -12,13 +12,16 @@ import queue
 import sys
 import threading
 import time
+from contextlib import contextmanager
+from dataclasses import dataclass
 
 import numpy as np
 from PyQt6.QtCore import Qt, QObject, pyqtSignal
 from PyQt6.QtGui import QFont, QImage, QKeyEvent, QPixmap
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QHBoxLayout, QLabel, QLayout, QMainWindow,
-    QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
+    QLayout, QMainWindow, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
+    QWidget,
 )
 
 # evo_usb ships as a submodule (./evo_usb_py/evo_usb.py). Put it on the path
@@ -67,6 +70,40 @@ def capture_screen_rgb565(retries: int = 2) -> bytes:
     raise last_err
 
 
+def default_varname(path: str) -> str:
+    """Suggest an AppVar name from a filename: drop the extension, keep only
+    ASCII letters (send_file's name encoder handles A-Z only), uppercase, and
+    cap at 8 chars. Falls back to FILE when nothing usable is left.
+    """
+    stem = os.path.splitext(os.path.basename(path))[0]
+    letters = "".join(c for c in stem if c.isascii() and c.isalpha())
+    return letters[:8].upper() or "FILE"
+
+
+@dataclass(frozen=True)
+class _SendCmd:
+    path: str
+    varname: str | None     # set -> send_file (Python); None -> send_var_file
+
+
+@dataclass(frozen=True)
+class _ListCmd:
+    pass                    # request the variable directory
+
+
+@dataclass(frozen=True)
+class _RecvCmd:
+    name: str
+    type_id: int
+    output: str
+
+
+@dataclass(frozen=True)
+class _DeleteCmd:
+    name: str
+    type_id: int
+
+
 class UsbWorker(QObject):
     """Single-thread USB I/O pump.
 
@@ -77,6 +114,9 @@ class UsbWorker(QObject):
 
     frame = pyqtSignal(bytes)    # RGB565 framebuffer
     status = pyqtSignal(str)     # human-readable status / errors
+    busy = pyqtSignal(bool)      # True when a transfer starts, False at end
+    file_list = pyqtSignal(object)   # list[dict] from list_files()
+    finished = pyqtSignal(bool, str)  # (success, human-readable message)
 
     # Queue sentinels (never valid scancodes) for non-scancode actions.
     _REFRESH = -1
@@ -86,7 +126,8 @@ class UsbWorker(QObject):
         super().__init__()
         self.poll_ms = poll_ms
         self.poll_enabled = True
-        self._q: "queue.Queue[int]" = queue.Queue()
+        self._q: "queue.Queue[int | _SendCmd | _ListCmd | _RecvCmd " \
+            "| _DeleteCmd]" = queue.Queue()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="usb-io"
@@ -109,14 +150,37 @@ class UsbWorker(QObject):
         """ON / quit-to-home, via hh01/sys/break, not a scancode."""
         self._q.put(self._BREAK)
 
+    def request_file_list(self):
+        self._q.put(_ListCmd())
+
+    def send_file_op(self, path: str, varname: str | None = None):
+        self._q.put(_SendCmd(path, varname))
+
+    def recv_file_op(self, name: str, type_id: int, output: str):
+        self._q.put(_RecvCmd(name, type_id, output))
+
+    def delete_op(self, name: str, type_id: int):
+        self._q.put(_DeleteCmd(name, type_id))
+
     # --- worker-thread internals ---
-    def _dispatch(self, code: int):
-        if code == self._REFRESH:
-            return                       # fall through to the post-IO grab
-        if code == self._BREAK:
-            self._break()
+    def _dispatch(self, code):
+        if isinstance(code, int):
+            if code == self._REFRESH:
+                return                   # fall through to the post-IO grab
+            if code == self._BREAK:
+                self._break()
+                return
+            self._send(code)
             return
-        self._send(code)
+        # Non-scancode command objects (file transfers, directory listing).
+        if isinstance(code, _ListCmd):
+            self._do_list()
+        elif isinstance(code, _SendCmd):
+            self._do_send(code)
+        elif isinstance(code, _RecvCmd):
+            self._do_recv(code)
+        elif isinstance(code, _DeleteCmd):
+            self._do_delete(code)
 
     def _send(self, code: int) -> bool:
         try:
@@ -149,6 +213,74 @@ class UsbWorker(QObject):
         except (Exception, SystemExit) as e:
             self.status.emit(f"screen read failed: {e}")
             time.sleep(0.25)
+
+    @contextmanager
+    def _transfer_guard(self):
+        """Run a blocking transfer with the background poll suppressed.
+
+        Snapshots the user's poll_enabled choice, forces polling off for the
+        duration, then restores it in finally (so an exception can't leave
+        polling stuck off or the GUI's File menu stuck disabled). Grabs one
+        fresh frame afterwards so the screen reflects the calc's new state.
+        """
+        prev_poll = self.poll_enabled
+        self.poll_enabled = False
+        self.busy.emit(True)
+        try:
+            yield
+        finally:
+            self.poll_enabled = prev_poll   # honor --no-poll / Live unchecked
+            self.busy.emit(False)
+            self._grab()
+
+    def _do_list(self):
+        with self._transfer_guard():
+            try:
+                entries = evo_usb.list_files()
+                self.status.emit(f"directory: {len(entries)} entries")
+                self.file_list.emit(entries)
+            except (Exception, SystemExit) as e:
+                self.status.emit(f"list failed: {e}")
+                self.finished.emit(
+                    False, f"Could not read the calculator: {e}")
+
+    def _do_send(self, cmd: _SendCmd):
+        with self._transfer_guard():
+            try:
+                if cmd.varname is not None:
+                    evo_usb.send_file(cmd.path, cmd.varname)
+                    msg = f"Sent {os.path.basename(cmd.path)} as " \
+                          f"'{cmd.varname}'."
+                else:
+                    evo_usb.send_var_file(cmd.path, "auto")
+                    msg = f"Sent {os.path.basename(cmd.path)}."
+                self.status.emit(msg)
+                self.finished.emit(True, msg)
+            except (Exception, SystemExit) as e:
+                self.status.emit(f"send failed: {e}")
+                self.finished.emit(False, f"Send failed: {e}")
+
+    def _do_recv(self, cmd: _RecvCmd):
+        with self._transfer_guard():
+            try:
+                evo_usb.get_variable(cmd.name, cmd.type_id, cmd.output)
+                msg = f"Saved {cmd.name} to {cmd.output}."
+                self.status.emit(msg)
+                self.finished.emit(True, msg)
+            except (Exception, SystemExit) as e:
+                self.status.emit(f"receive failed: {e}")
+                self.finished.emit(False, f"Receive failed: {e}")
+
+    def _do_delete(self, cmd: _DeleteCmd):
+        with self._transfer_guard():
+            try:
+                evo_usb.delete_variable(cmd.name, cmd.type_id)
+                msg = f"Deleted {cmd.name}."
+                self.status.emit(msg)
+                self.finished.emit(True, msg)
+            except (Exception, SystemExit) as e:
+                self.status.emit(f"delete failed: {e}")
+                self.finished.emit(False, f"Delete failed: {e}")
 
     def _run(self):
         self._grab()  # initial frame
@@ -242,10 +374,18 @@ class RemoteWindow(QMainWindow):
         self.scale = scale
         self.debug = debug
         self.debug_window = DebugWindow(worker) if debug else None
+        # Whether a pending file_list is for a "recv" or "delete" interaction,
+        # so a stray listing never pops a dialog. None when nothing is awaited.
+        self._awaiting_list: str | None = None
         self.setWindowTitle("TI-84 Evo - USB remote")
-        self.setStyleSheet("QMainWindow { background: #f4f7fa; }")
 
         central = QWidget()
+        # Skin only the body, not the whole window. Painting the background on
+        # the QMainWindow bleeds under the transparent menu bar, leaving its
+        # (system-themed) text unreadable on the light body; scoping it to the
+        # central widget keeps the menu bar on the OS palette.
+        central.setObjectName("body")
+        central.setStyleSheet("#body { background: #f4f7fa; }")
         outer = QVBoxLayout(central)
         outer.setContentsMargins(8, 8, 8, 8)
         # Lock the window to its content size (no user resizing). This tracks
@@ -283,6 +423,15 @@ class RemoteWindow(QMainWindow):
                         alignment=Qt.AlignmentFlag.AlignHCenter)
 
         self.setCentralWidget(central)
+
+        # File menu for transfers. The menu bar lives in its own reserved
+        # region, so it doesn't disturb the central widget's fixed-size layout;
+        # build it before setFixedSize(sizeHint()) so its height is counted.
+        m = self.menuBar().addMenu("File")
+        self.send_action = m.addAction("Send File…", self._on_send)
+        self.recv_action = m.addAction("Receive File…", self._on_receive)
+        self.delete_action = m.addAction("Delete Variable…", self._on_delete)
+
         # SetFixedSize above only pins the window's minimum; lock the maximum
         # too so it can't be resized at all. sizeHint already accounts for
         # --scale (the screen label is sized from it).
@@ -291,6 +440,9 @@ class RemoteWindow(QMainWindow):
 
         worker.frame.connect(self.on_frame)
         worker.status.connect(self._on_status)
+        worker.busy.connect(self._on_busy)
+        worker.file_list.connect(self._on_file_list)
+        worker.finished.connect(self._on_finished)
 
     def _on_status(self, text: str):
         # Route to the debug window if open. Otherwise only surface real
@@ -299,6 +451,86 @@ class RemoteWindow(QMainWindow):
             self.debug_window.set_status(text)
         elif "fail" in text.lower() or "error" in text.lower():
             print(text, file=sys.stderr)
+
+    # --- file transfer (File menu) ---
+    def _on_send(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Send File to Calculator", "",
+            "Calculator files (*.8x* *.8c* *.py);;All files (*)")
+        if not path:
+            return
+        if path.lower().endswith(".py"):
+            varname, ok = QInputDialog.getText(
+                self, "Send Python Script",
+                "AppVar name (≤8 letters, A–Z):", text=default_varname(path))
+            if not ok:
+                return
+            varname = varname.strip().upper()
+            valid = (1 <= len(varname) <= 8
+                     and varname.isascii() and varname.isalpha())
+            if not valid:
+                QMessageBox.warning(self, "Send File",
+                                    "Name must be 1–8 letters (A–Z).")
+                return
+            self.worker.send_file_op(path, varname)
+        else:
+            self.worker.send_file_op(path)
+
+    def _on_receive(self):
+        self._awaiting_list = "recv"
+        self.worker.request_file_list()
+
+    def _on_delete(self):
+        self._awaiting_list = "delete"
+        self.worker.request_file_list()
+
+    def _on_file_list(self, entries):
+        mode, self._awaiting_list = self._awaiting_list, None
+        if mode is None:
+            return
+        if not entries:
+            QMessageBox.information(
+                self, "File", "No variables on calculator.")
+            return
+
+        labels = [
+            f"{e['name']}  (type {e['type']}, {e['size']}B, "
+            f"{'RAM' if not e['mem'] else 'Arc'})"
+            for e in entries
+        ]
+        title = "Receive File" if mode == "recv" else "Delete Variable"
+        prompt = "Variable to download:" if mode == "recv" \
+            else "Variable to delete:"
+        label, ok = QInputDialog.getItem(
+            self, title, prompt, labels, 0, editable=False)
+        if not ok:
+            return
+        entry = entries[labels.index(label)]
+
+        if mode == "recv":
+            ext = evo_usb.EVO_TYPE_EXTENSIONS.get(entry["type"], "bin")
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save Variable As", f"{entry['name']}.{ext}")
+            if not path:
+                return
+            self.worker.recv_file_op(entry["name"], entry["type"], path)
+        else:
+            if QMessageBox.question(
+                    self, "Delete Variable",
+                    f"Delete {entry['name']} from the calculator?"
+            ) == QMessageBox.StandardButton.Yes:
+                self.worker.delete_op(entry["name"], entry["type"])
+
+    def _on_busy(self, busy: bool):
+        self.send_action.setEnabled(not busy)
+        self.recv_action.setEnabled(not busy)
+        self.delete_action.setEnabled(not busy)
+
+    def _on_finished(self, success: bool, msg: str):
+        if success:
+            QMessageBox.information(self, "Transfer", msg)
+        else:
+            QMessageBox.warning(self, "Transfer", msg)
 
     # --- input ---
     def press_key(self, label: str):
