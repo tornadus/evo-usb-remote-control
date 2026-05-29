@@ -9,7 +9,9 @@ clickable virtual keypad as well as keybinds for your physical keyboard!
 
 | Path            | Description                                                                |
 | --------------- | -------------------------------------------------------------------------- |
-| `calc_remote.py`| Window, USB I/O worker thread, screen/keypad wiring                        |
+| `calc_remote.py`| Entry point: CLI args and app launch                                       |
+| `worker.py`     | USB I/O worker thread, screen capture, file-transfer commands              |
+| `window.py`     | Main/debug windows, offline overlay, screen rendering, File-menu wiring    |
 | `keypad.py`     | The virtual keypad widget and keymapping                                   |
 | `evo_usb_py/`   | Submodule: the low-level USB/Kermit transport (`evo_usb`), pinned upstream.|
 
