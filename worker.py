@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import os
 import queue
+import struct
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
@@ -50,6 +52,49 @@ def capture_screen_rgb565(retries: int = 2) -> bytes:
             last_err = e
             time.sleep(0.15)
     raise last_err
+
+
+def pyvar_to_source(data: bytes) -> bytes:
+    """Extract the original UTF-8 Python source from a downloaded .8xpy2.
+
+    The file is the pyVar CBOR map (as built by evo_usb.build_payload) plus
+    get_variable's trailing 2-byte checksum. The source text sits, byte for
+    byte, inside the nested AppVar blob after a fixed header.
+    """
+    parsed = evo_usb.cbor_loads(data[:-2])      # drop the trailing checksum
+    if parsed.get("metaData", {}).get("type") != 15:
+        raise ValueError("not a Python script (type 15) AppVar")
+    appvar = parsed["data"]
+    if appvar[:4] != b"\x13\x01\x00\x00":
+        raise ValueError("unrecognized AppVar header")
+    off = 12 + appvar[8]                         # skip header + name
+    if appvar[off + 3:off + 5] != b"\x00\x02":
+        raise ValueError("unrecognized AppVar body marker")
+    src_len = struct.unpack_from("<H", appvar, off + 1)[0]
+    return appvar[off + 5:off + 5 + src_len]
+
+
+def recv_python_source(name, type_id, output):
+    """Download a type-15 var to a temp file, decode it, write .py source.
+
+    Goes through evo_usb.get_variable (same transport as a normal receive) so
+    the final .py is only written on a successful decode.
+    """
+    fd, tmp = tempfile.mkstemp(suffix=".8xpy2",
+                               dir=os.path.dirname(output) or ".")
+    os.close(fd)
+    try:
+        evo_usb.get_variable(name, type_id, tmp)
+        with open(tmp, "rb") as f:
+            raw = f.read()
+        source = pyvar_to_source(raw)
+        with open(output, "wb") as f:           # byte-exact UTF-8 source
+            f.write(source)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -268,7 +313,10 @@ class UsbWorker(QObject):
     def _do_recv(self, cmd: _RecvCmd):
         with self._transfer_guard():
             try:
-                evo_usb.get_variable(cmd.name, cmd.type_id, cmd.output)
+                if cmd.type_id == 15:
+                    recv_python_source(cmd.name, cmd.type_id, cmd.output)
+                else:
+                    evo_usb.get_variable(cmd.name, cmd.type_id, cmd.output)
                 msg = f"Saved {cmd.name} to {cmd.output}."
                 self.status.emit(msg)
                 self.finished.emit(True, msg)

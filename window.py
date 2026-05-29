@@ -281,8 +281,9 @@ class RemoteWindow(QMainWindow):
             return
 
         labels = [
-            f"{e['name']}  (type {e['type']}, {e['size']}B, "
-            f"{'RAM' if not e['mem'] else 'Arc'})"
+            f"{e['name']}  "
+            f"({evo_usb.EVO_TYPE_EXTENSIONS.get(e['type'], 'bin')}, "
+            f"{e['size']}B, {'RAM' if not e['mem'] else 'Arc'})"
             for e in entries
         ]
         title = "Receive File" if mode == "recv" else "Delete Variable"
@@ -295,9 +296,16 @@ class RemoteWindow(QMainWindow):
         entry = entries[labels.index(label)]
 
         if mode == "recv":
-            ext = evo_usb.EVO_TYPE_EXTENSIONS.get(entry["type"], "bin")
+            if entry["type"] == 15:
+                # Python scripts download as readable source, not raw AppVar.
+                default = f"{entry['name']}.py"
+                filt = "Python source (*.py)"
+            else:
+                ext = evo_usb.EVO_TYPE_EXTENSIONS.get(entry["type"], "bin")
+                default = f"{entry['name']}.{ext}"
+                filt = ""
             path, _ = QFileDialog.getSaveFileName(
-                self, "Save Variable As", f"{entry['name']}.{ext}")
+                self, "Save Variable As", default, filt)
             if not path:
                 return
             self.worker.recv_file_op(entry["name"], entry["type"], path)
