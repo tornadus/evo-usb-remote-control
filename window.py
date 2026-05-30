@@ -16,11 +16,13 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QColor, QFont, QImage, QKeyEvent, QPainter, QPixmap
+from PyQt6.QtGui import (
+    QAction, QActionGroup, QColor, QFont, QImage, QKeyEvent, QPainter, QPixmap,
+)
 from PyQt6.QtWidgets import (
     QCheckBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLayout, QMainWindow, QMessageBox, QPushButton, QSpinBox, QVBoxLayout,
-    QWidget,
+    QWidget, QWIDGETSIZE_MAX,
 )
 
 # evo_usb ships as a submodule (./evo_usb_py/evo_usb.py). Put it on the path
@@ -159,69 +161,54 @@ class RemoteWindow(QMainWindow):
         self._awaiting_list: str | None = None
         # Mirror of the worker's connection state; gates input while offline.
         self._online = False
+        # Keypad position relative to the screen and the last frame received,
+        # both adjustable on the fly from the View menu. The frame is kept so a
+        # scale change can re-render a frozen screen without a fresh frame.
+        self.keypad_side = "below"
+        self._last_img = None
+        # CSS border around the screen; insets the content rect, so the label
+        # must be sized to the pixmap plus the border on each side.
+        self.border = 2
         self.setWindowTitle("TI-84 Evo - USB remote")
 
-        central = QWidget()
-        # Skin only the body, not the whole window. Painting the background on
-        # the QMainWindow bleeds under the transparent menu bar, leaving its
-        # (system-themed) text unreadable on the light body; scoping it to the
-        # central widget keeps the menu bar on the OS palette.
-        central.setObjectName("body")
-        central.setStyleSheet("#body { background: #f4f7fa; }")
-        outer = QVBoxLayout(central)
-        outer.setContentsMargins(8, 8, 8, 8)
-        # Lock the window to its content size (no user resizing). This tracks
-        # --scale automatically, since the screen label is sized from it.
-        outer.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
-
-        # Model name, centered above the display, in a sans-serif face.
-        model_lbl = QLabel("TI-84 Evo")
+        # Persistent leaf widgets. Built once and reparented onto a freshly
+        # built central widget whenever the keypad position changes, so their
+        # state (and the keypad's signal wiring) survives a relayout.
+        self.model_lbl = QLabel("TI-84 Evo")     # centered above the display
         model_font = QFont()
         model_font.setStyleHint(QFont.StyleHint.SansSerif)
         model_font.setFamily(model_font.defaultFamily())  # concrete family
         model_font.setBold(True)
         model_font.setPixelSize(14)
-        model_lbl.setFont(model_font)
-        model_lbl.setStyleSheet("color: #2b333a;")
-        model_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        outer.addWidget(model_lbl, alignment=Qt.AlignmentFlag.AlignHCenter)
+        self.model_lbl.setFont(model_font)
+        self.model_lbl.setStyleSheet("color: #2b333a;")
+        self.model_lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter)
 
-        # Screen. The CSS border insets the content rect, so size the label
-        # to the pixmap plus the border on each side, otherwise the outer
-        # 2px of the framebuffer (e.g. the battery icon) gets clipped.
-        border = 2
         self.screen_label = QLabel()
-        self.screen_label.setFixedSize(SCREEN_W * scale + 2 * border,
-                                       SCREEN_H * scale + 2 * border)
+        self.screen_label.setFixedSize(SCREEN_W * scale + 2 * self.border,
+                                       SCREEN_H * scale + 2 * self.border)
         self.screen_label.setStyleSheet(
-            f"border: {border}px solid #aab; background: #000;"
+            f"border: {self.border}px solid #aab; background: #000;"
         )
         self.screen_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        outer.addWidget(self.screen_label,
-                        alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Disconnect veil, parented to the same widget that owns the screen
-        # label's layout, so its geometry maps cleanly over the label.
-        self.overlay = Overlay(central)
+        self.keypad = build_keypad(self.press_key)
 
-        # Virtual keypad.
-        outer.addWidget(build_keypad(self.press_key),
-                        alignment=Qt.AlignmentFlag.AlignHCenter)
+        # Disconnect veil, parented to self for now; _apply_layout reparents it
+        # onto each central it builds so its geometry maps over the screen.
+        self.overlay = Overlay(self)
 
-        self.setCentralWidget(central)
-
-        # File menu for transfers. The menu bar lives in its own reserved
-        # region, so it doesn't disturb the central widget's fixed-size layout;
-        # build it before setFixedSize(sizeHint()) so its height is counted.
+        # Menus live in the menu bar's own reserved region, so they don't
+        # disturb the central widget's fixed-size layout. Build them before the
+        # first _apply_layout so their height is counted in sizeHint().
         m = self.menuBar().addMenu("File")
         self.send_action = m.addAction("Send File…", self._on_send)
         self.recv_action = m.addAction("Receive File…", self._on_receive)
         self.delete_action = m.addAction("Delete Variable…", self._on_delete)
+        self._build_view_menu()
 
-        # SetFixedSize above only pins the window's minimum; lock the maximum
-        # too so it can't be resized at all. sizeHint already accounts for
-        # --scale (the screen label is sized from it).
-        self.setFixedSize(self.sizeHint())
+        # Arrange screen + keypad and lock the window to that content size.
+        self._apply_layout()
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         worker.frame.connect(self.on_frame)
@@ -230,6 +217,119 @@ class RemoteWindow(QMainWindow):
         worker.file_list.connect(self._on_file_list)
         worker.finished.connect(self._on_finished)
         worker.connection.connect(self._on_connection)
+
+    # --- view (scale / keypad position) ---
+    def _build_view_menu(self):
+        """View menu: live screen scale and keypad position, as two exclusive
+        radio groups. Selections are session-only (not persisted)."""
+        view = self.menuBar().addMenu("View")
+
+        self._scale_group = QActionGroup(self)
+        self._scale_group.setExclusive(True)
+        view.addSection("Scale")
+        for n, text in ((1, "1x"), (2, "2x")):
+            act = QAction(text, self, checkable=True)
+            act.setChecked(n == self.scale)
+            act.triggered.connect(lambda _checked, k=n: self.set_scale(k))
+            self._scale_group.addAction(act)
+            view.addAction(act)
+
+        view.addSeparator()
+
+        self._side_group = QActionGroup(self)
+        self._side_group.setExclusive(True)
+        view.addSection("Keypad position")
+        for side, text in (("below", "Below"), ("left", "Left"),
+                           ("right", "Right")):
+            act = QAction(text, self, checkable=True)
+            act.setChecked(side == self.keypad_side)
+            act.triggered.connect(
+                lambda _checked, s=side: self.set_keypad_side(s))
+            self._side_group.addAction(act)
+            view.addAction(act)
+
+    def _apply_layout(self):
+        """(Re)build the central widget for the current keypad position,
+        reusing the persistent screen/keypad/overlay widgets, then re-lock the
+        window to fit. Called on startup and on each keypad-position change."""
+        self.setUpdatesEnabled(False)
+
+        central = QWidget()
+        # Skin only the body, not the whole window: painting the background on
+        # the QMainWindow bleeds under the transparent menu bar, leaving its
+        # (system-themed) text unreadable on the light body.
+        central.setObjectName("body")
+        central.setStyleSheet("#body { background: #f4f7fa; }")
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(8, 8, 8, 8)
+        # Lock the window to its content size (no user resizing).
+        outer.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
+
+        outer.addWidget(self.model_lbl,
+                        alignment=Qt.AlignmentFlag.AlignHCenter)
+
+        if self.keypad_side == "below":
+            outer.addWidget(self.screen_label,
+                            alignment=Qt.AlignmentFlag.AlignCenter)
+            outer.addWidget(self.keypad,
+                            alignment=Qt.AlignmentFlag.AlignHCenter)
+        else:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            if self.keypad_side == "left":
+                widgets = (self.keypad, self.screen_label)
+            else:
+                widgets = (self.screen_label, self.keypad)
+            for w in widgets:
+                row.addWidget(w, alignment=Qt.AlignmentFlag.AlignVCenter)
+            outer.addLayout(row)
+
+        # The overlay isn't in any layout, so reparent it onto the new central
+        # before setCentralWidget deletes the old one (else it dies with it).
+        self.overlay.setParent(central)
+        self.overlay.hide()
+
+        self.setCentralWidget(central)
+        self._refit()
+        self._render_screen()
+        self._sync_overlay()
+        self.setFocus()             # keep receiving physical-keyboard keys
+        if not self._online:
+            self.overlay.show()
+            self.overlay.raise_()
+
+        self.setUpdatesEnabled(True)
+
+    def _refit(self):
+        """Re-lock the window to its current content size. The existing fixed
+        pin is released first, then both layouts re-activated, so sizeHint()
+        reflects the new content rather than the stale pinned size."""
+        self.setMinimumSize(0, 0)
+        self.setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX)
+        cw = self.centralWidget()
+        if cw is not None and cw.layout() is not None:
+            cw.layout().invalidate()
+            cw.layout().activate()
+        self.layout().invalidate()      # QMainWindowLayout (menu + central)
+        self.layout().activate()
+        self.setFixedSize(self.sizeHint())
+
+    def set_scale(self, n: int):
+        if n == self.scale:
+            return
+        self.scale = n
+        self.screen_label.setFixedSize(SCREEN_W * n + 2 * self.border,
+                                       SCREEN_H * n + 2 * self.border)
+        self._render_screen()   # re-scale the frozen frame to the new size
+        self._refit()           # window grows/shrinks to the new label
+        self._sync_overlay()    # veil tracks the resized label
+
+    def set_keypad_side(self, side: str):
+        if side == self.keypad_side:
+            return
+        self.keypad_side = side
+        self._apply_layout()
 
     def _on_status(self, text: str):
         # Route to the debug window if open. Otherwise only surface real
@@ -391,18 +491,28 @@ class RemoteWindow(QMainWindow):
         self.press_key(label)
 
     # --- output ---
-    def on_frame(self, rgb565: bytes):
-        rgb888 = rgb565_to_rgb888(rgb565)
-        img = QImage(
-            rgb888, SCREEN_W, SCREEN_H, SCREEN_W * 3,
-            QImage.Format.Format_RGB888,
-        ).copy()
-        pix = QPixmap.fromImage(img).scaled(
+    def _render_screen(self):
+        """Scale the last received frame to the current zoom and show it. A
+        no-op until the first frame arrives; called again on a scale change so
+        a frozen screen re-renders immediately, with no fresh frame needed."""
+        if self._last_img is None:
+            return
+        pix = QPixmap.fromImage(self._last_img).scaled(
             SCREEN_W * self.scale, SCREEN_H * self.scale,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation,
         )
         self.screen_label.setPixmap(pix)
+
+    def on_frame(self, rgb565: bytes):
+        rgb888 = rgb565_to_rgb888(rgb565)
+        # .copy() detaches from the local buffer so the image stays valid for
+        # re-rendering after the next scale change, not just this frame.
+        self._last_img = QImage(
+            rgb888, SCREEN_W, SCREEN_H, SCREEN_W * 3,
+            QImage.Format.Format_RGB888,
+        ).copy()
+        self._render_screen()
 
     def closeEvent(self, event):
         self.worker.stop()
