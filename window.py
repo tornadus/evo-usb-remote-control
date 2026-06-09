@@ -205,6 +205,11 @@ class RemoteWindow(QMainWindow):
         self.send_action = m.addAction("Send File…", self._on_send)
         self.recv_action = m.addAction("Receive File…", self._on_receive)
         self.delete_action = m.addAction("Delete Variable…", self._on_delete)
+        m.addSeparator()
+        self.csv_list_action = m.addAction(
+            "Send CSV as List…", lambda: self._on_send_csv("list"))
+        self.csv_matrix_action = m.addAction(
+            "Send CSV as Matrix…", lambda: self._on_send_csv("matrix"))
         self._build_view_menu()
 
         # Arrange screen + keypad and lock the window to that content size.
@@ -363,6 +368,35 @@ class RemoteWindow(QMainWindow):
         else:
             self.worker.send_file_op(path)
 
+    def _on_send_csv(self, kind: str):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Send CSV to Calculator", "",
+            "CSV files (*.csv);;All files (*)")
+        if not path:
+            return
+        if kind == "matrix":
+            title, hint, default = (
+                "Send CSV as Matrix", "Matrix name (A–J):", "A")
+        else:
+            title, hint, default = (
+                "Send CSV as List",
+                "List name (L1–L6 or a 1–5 character name):", "L1")
+        # The backend validates the name (raising ValueError on a bad one,
+        # surfaced via the finished signal), so only screen out the empty case.
+        name, ok = QInputDialog.getText(self, title, hint, text=default)
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            return
+        target, ok = QInputDialog.getItem(
+            self, title, "Memory target:", ["RAM", "Archive"], 0,
+            editable=False)
+        if not ok:
+            return
+        self.worker.send_csv_op(
+            path, kind, name, archive=(target == "Archive"))
+
     def _on_receive(self):
         self._awaiting_list = "recv"
         self.worker.request_file_list()
@@ -420,6 +454,8 @@ class RemoteWindow(QMainWindow):
         self.send_action.setEnabled(not busy)
         self.recv_action.setEnabled(not busy)
         self.delete_action.setEnabled(not busy)
+        self.csv_list_action.setEnabled(not busy)
+        self.csv_matrix_action.setEnabled(not busy)
 
     def _on_finished(self, success: bool, msg: str):
         if success:

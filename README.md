@@ -46,6 +46,10 @@ python calc_remote.py [--poll-ms N] [--no-poll] [--scale N] [--debug]
 - `--scale N`: screen magnification (default 1).
 - `--debug`: show the live/poll/refresh controls and a status readout in a separate window.
 
+The **File** menu moves variables to and from the calculator: send a file or
+Python script, receive or delete a variable, and import a CSV as a list (`L1`-`L6`
+or a 1-5 character list name) or a matrix (`A`-`J`).
+
 ## Keyboard mapping
 
 The keyboard bindings mirror TI's

@@ -35,9 +35,8 @@ from keypad import SCREEN_BYTES  # noqa: E402
 def capture_screen_rgb565(retries: int = 2) -> bytes:
     """Pull one framebuffer from the calc (sys/screen) as raw RGB565 bytes.
 
-    The screen URL returns CBOR. The pixel blob is a definite-length byte
-    string (major type 2) introduced by 0x5A + a 4-byte length, exactly as
-    evo_usb.take_screenshot decodes it.
+    The screen URL returns a CBOR map; evo_usb.screen_rgb565_from_payload
+    parses it and returns exactly SCREEN_BYTES of pixel data (or raises).
 
     The serial link occasionally returns a desynced/short first packet after
     an idle gap, so retry a couple of times before giving up.
@@ -46,8 +45,7 @@ def capture_screen_rgb565(retries: int = 2) -> bytes:
     for _ in range(retries + 1):
         try:
             raw = evo_usb._get_request(evo_usb._screen_url(0))
-            marker = raw.index(0x5A)
-            return raw[marker + 5:marker + 5 + SCREEN_BYTES]
+            return evo_usb.screen_rgb565_from_payload(raw)
         except Exception as e:  # framing desync, short read, etc.
             last_err = e
             time.sleep(0.15)
@@ -121,6 +119,15 @@ class _DeleteCmd:
     type_id: int
 
 
+@dataclass(frozen=True)
+class _CsvCmd:
+    path: str
+    kind: str               # "list" or "matrix"
+    name: str
+    archive: bool
+    overwrite: bool = True
+
+
 class UsbWorker(QObject):
     """Single-thread USB I/O pump.
 
@@ -149,7 +156,7 @@ class UsbWorker(QObject):
         self._online: bool | None = None
         self._offline_probe_ms = 750    # reconnect probe cadence while offline
         self._q: "queue.Queue[int | _SendCmd | _ListCmd | _RecvCmd " \
-            "| _DeleteCmd]" = queue.Queue()
+            "| _DeleteCmd | _CsvCmd]" = queue.Queue()
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="usb-io"
@@ -184,6 +191,10 @@ class UsbWorker(QObject):
     def delete_op(self, name: str, type_id: int):
         self._q.put(_DeleteCmd(name, type_id))
 
+    def send_csv_op(self, path: str, kind: str, name: str,
+                    archive: bool, overwrite: bool = True):
+        self._q.put(_CsvCmd(path, kind, name, archive, overwrite))
+
     # --- worker-thread internals ---
     def _set_online(self, online: bool, reason: str = ""):
         """Flip connection state, emitting `connection` only on a transition.
@@ -205,6 +216,25 @@ class UsbWorker(QObject):
             return "Searching for calculator…"
         return "Disconnected"
 
+    def _dispatch_batch(self, items):
+        """Run a drained batch of queue items in order, coalescing runs of
+        consecutive scancodes into a single send_scancodes() session.
+
+        Sentinels (_REFRESH/_BREAK) and command objects flush the pending
+        keys first, then run on their own, so ordering is preserved.
+        """
+        pending: list[int] = []
+        for item in items:
+            if isinstance(item, int) and item >= 0:
+                pending.append(item)        # a real scancode
+                continue
+            if pending:
+                self._send_codes(pending)
+                pending = []
+            self._dispatch(item)
+        if pending:
+            self._send_codes(pending)
+
     def _dispatch(self, code):
         if isinstance(code, int):
             if code == self._REFRESH:
@@ -212,7 +242,7 @@ class UsbWorker(QObject):
             if code == self._BREAK:
                 self._break()
                 return
-            self._send(code)
+            self._send_codes([code])
             return
         # Non-scancode command objects (file transfers, directory listing).
         if isinstance(code, _ListCmd):
@@ -223,13 +253,19 @@ class UsbWorker(QObject):
             self._do_recv(code)
         elif isinstance(code, _DeleteCmd):
             self._do_delete(code)
+        elif isinstance(code, _CsvCmd):
+            self._do_csv(code)
 
-    def _send(self, code: int) -> bool:
+    def _send_codes(self, codes: list[int]) -> bool:
+        """Send one or more scancodes over a single Kermit session."""
+        if not codes:
+            return True
         try:
-            evo_usb.send_scancode(code)
+            evo_usb.send_scancodes(codes)
             return True
         except (Exception, SystemExit) as e:
-            self.status.emit(f"send 0x{code:02X} failed: {e}")
+            label = ", ".join(f"0x{c:02X}" for c in codes)
+            self.status.emit(f"send {label} failed: {e}")
             self._set_online(False, self._reason_for(e))
             time.sleep(0.25)
             return False
@@ -337,21 +373,42 @@ class UsbWorker(QObject):
                 self._set_online(False, self._reason_for(e))
                 self.finished.emit(False, f"Delete failed: {e}")
 
+    def _do_csv(self, cmd: _CsvCmd):
+        with self._transfer_guard():
+            try:
+                target = "archive" if cmd.archive else "ram"
+                if cmd.kind == "matrix":
+                    evo_usb.send_csv_matrix(
+                        cmd.path, cmd.name, target, cmd.overwrite)
+                else:
+                    evo_usb.send_csv_list(
+                        cmd.path, cmd.name, target, cmd.overwrite)
+                msg = f"Sent {os.path.basename(cmd.path)} as " \
+                      f"{cmd.kind} {cmd.name}."
+                self.status.emit(msg)
+                self.finished.emit(True, msg)
+            except (Exception, SystemExit) as e:
+                self.status.emit(f"csv send failed: {e}")
+                self._set_online(False, self._reason_for(e))
+                self.finished.emit(False, f"CSV import failed: {e}")
+
     def _run(self):
         self._grab()  # initial frame
         last = time.monotonic()
         while not self._stop.is_set():
             did_io = False
             try:
-                self._dispatch(self._q.get(timeout=0.05))
+                # Drain everything queued (the blocking get plus anything
+                # behind it), then act on the whole batch and take a single
+                # screenshot for it.
+                items = [self._q.get(timeout=0.05)]
                 did_io = True
-                # Drain anything queued while we were busy, act on it all,
-                # then take a single screenshot for the batch.
                 while True:
                     try:
-                        self._dispatch(self._q.get_nowait())
+                        items.append(self._q.get_nowait())
                     except queue.Empty:
                         break
+                self._dispatch_batch(items)
             except queue.Empty:
                 pass
 
